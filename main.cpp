@@ -13,8 +13,8 @@ constexpr int CHAR_W = 8;
 constexpr int CHAR_H = 8;
 constexpr int TOTAL_COLS = 100;
 constexpr int ROWS = 60;
-constexpr int NATIVE_WIDTH = TOTAL_COLS * CHAR_W;  // 800
-constexpr int NATIVE_HEIGHT = ROWS * CHAR_H;       // 480
+constexpr int NATIVE_WIDTH = TOTAL_COLS * CHAR_W;  
+constexpr int NATIVE_HEIGHT = ROWS * CHAR_H;       
 
 struct ResolutionPreset {
     int width;
@@ -35,21 +35,23 @@ constexpr double FIXED_TIMESTEP = 1000.0 / 60.0;
 constexpr int MAP_W = 27;
 constexpr int MAP_H = 27;
 
-// --- ELEVATION-BASED DYNAMIC PALETTES (Dark -> Bright) ---
-// Ground Level (0.0): Deep Dark Forest Greens
+// Clean Palettes
 constexpr uint32_t TIER_LOW_BRIGHT  = 0xFF16A34A;
 constexpr uint32_t TIER_LOW_MID     = 0xFF15803D;
 constexpr uint32_t TIER_LOW_DARK    = 0xFF14532D;
 
-// Mid Incline / Stairs (0.5): Vibrant Cyan
 constexpr uint32_t TIER_MID_BRIGHT  = 0xFF38BDF8;
 constexpr uint32_t TIER_MID_MID     = 0xFF0284C7;
 constexpr uint32_t TIER_MID_DARK    = 0xFF0369A1;
 
-// High Platform / Overpass (1.0+): High-Illumination Neon Lime
 constexpr uint32_t TIER_HIGH_BRIGHT = 0xFF86EFAC;
 constexpr uint32_t TIER_HIGH_MID    = 0xFF4ADE80;
 constexpr uint32_t TIER_HIGH_DARK   = 0xFF22C55E;
+
+// Corrupted Nightmare Palettes (Reds & Ambers)
+constexpr uint32_t CORRUPT_BRIGHT   = 0xFFF43F5E;
+constexpr uint32_t CORRUPT_MID      = 0xFFBE123C;
+constexpr uint32_t CORRUPT_DARK     = 0xFF881337;
 
 constexpr uint32_t RED_GOAL_BRIGHT  = 0xFFF43F5E;
 constexpr uint32_t RED_GOAL_DARK    = 0xFFBE123C;
@@ -60,6 +62,8 @@ constexpr int AUDIO_BUFFER_SIZE = 1024;
 enum GameState {
     STATE_TITLE,
     STATE_PLAYING,
+    STATE_PAUSED,
+    STATE_JUMPSCARE,
     STATE_SUCCESS,
     STATE_GAMEOVER
 };
@@ -106,8 +110,8 @@ const uint8_t FONT_8X8[96][8] = {
 struct Point { int x, y; };
 
 struct MapCell {
-    int wallType = 0;      // 0 = Air, 1 = Wall, 2 = Goal
-    float floorH = 0.0f;   // 0.0 = Ground, 0.5 = Stairs, 1.0 = Overpass
+    int wallType = 0;
+    float floorH = 0.0f;
     float ceilH = 2.0f;
     bool isStairs = false;
 };
@@ -116,9 +120,12 @@ struct AudioState {
     float ambientPhase = 0.0f;
     float heartbeatPhase = 0.0f;
     float monsterPhase = 0.0f;
+    float screamPhase = 0.0f;
     float sanity = 100.0f;
     float monsterDist = 20.0f;
+    float corruption = 0.0f;
     bool isChasing = false;
+    bool isJumpscare = false;
     bool inGame = false;
 };
 
@@ -128,14 +135,31 @@ void audioCallback(void* userdata, Uint8* stream, int len) {
     int samples = len / sizeof(int16_t);
 
     for (int i = 0; i < samples; ++i) {
-        if (!audio->inGame) {
+        if (!audio->inGame && !audio->isJumpscare) {
             buffer[i] = 0;
             continue;
         }
 
+        if (audio->isJumpscare) {
+            // Demonic piercing shriek mixed with white noise static
+            audio->screamPhase += (350.0f * 2.0f * 3.14159265f) / AUDIO_SAMPLE_RATE;
+            if (audio->screamPhase > 2.0f * 3.14159265f) audio->screamPhase -= 2.0f * 3.14159265f;
+            
+            float screech = std::sin(audio->screamPhase) * 0.5f;
+            float rawNoise = ((rand() % 2000) / 1000.0f - 1.0f) * 0.7f;
+            float demonicRumble = std::sin(audio->screamPhase * 0.1f) * 0.4f;
+
+            buffer[i] = static_cast<int16_t>(std::clamp(screech + rawNoise + demonicRumble, -1.0f, 1.0f) * 32767.0f);
+            continue;
+        }
+
+        float mixAmbient = std::clamp((audio->corruption - 0.2f) * 4.0f, 0.0f, 1.0f);
+        float mixHeart   = std::clamp((audio->corruption - 0.5f) * 3.0f, 0.0f, 1.0f);
+        float mixMonster = std::clamp((audio->corruption - 0.6f) * 3.0f, 0.0f, 1.0f);
+
         audio->ambientPhase += (42.0f * 2.0f * 3.14159265f) / AUDIO_SAMPLE_RATE;
         if (audio->ambientPhase > 2.0f * 3.14159265f) audio->ambientPhase -= 2.0f * 3.14159265f;
-        float ambient = std::sin(audio->ambientPhase) * 0.08f;
+        float ambient = std::sin(audio->ambientPhase) * 0.08f * mixAmbient;
 
         float heartBPM = 1.0f + (100.0f - audio->sanity) / 100.0f * 2.0f;
         audio->heartbeatPhase += (heartBPM * 2.0f * 3.14159265f) / AUDIO_SAMPLE_RATE;
@@ -146,7 +170,7 @@ void audioCallback(void* userdata, Uint8* stream, int len) {
         if (cyclePos < 0.15f) beatEnv = std::sin(cyclePos / 0.15f * 3.14159265f);
         else if (cyclePos > 0.22f && cyclePos < 0.35f) beatEnv = std::sin((cyclePos - 0.22f) / 0.13f * 3.14159265f) * 0.7f;
 
-        float heartbeat = std::sin(audio->heartbeatPhase * 40.0f) * beatEnv * (0.35f + (100.0f - audio->sanity) / 100.0f * 0.50f);
+        float heartbeat = std::sin(audio->heartbeatPhase * 40.0f) * beatEnv * (0.35f + (100.0f - audio->sanity) / 100.0f * 0.50f) * mixHeart;
 
         float monsterAudio = 0.0f;
         if (audio->monsterDist < 10.0f) {
@@ -156,7 +180,7 @@ void audioCallback(void* userdata, Uint8* stream, int len) {
             if (audio->monsterPhase > 2.0f * 3.14159265f) audio->monsterPhase -= 2.0f * 3.14159265f;
 
             float noise = ((rand() % 2000) / 1000.0f - 1.0f);
-            monsterAudio = noise * (std::sin(audio->monsterPhase) * 0.5f + 0.5f) * proxVol * 0.4f;
+            monsterAudio = noise * (std::sin(audio->monsterPhase) * 0.5f + 0.5f) * proxVol * 0.4f * mixMonster;
         }
 
         buffer[i] = static_cast<int16_t>(std::clamp(ambient + heartbeat + monsterAudio, -1.0f, 1.0f) * 32767.0f);
@@ -185,7 +209,9 @@ private:
     int currentLevel = 1;
     int totalSteps = 0;
     float levelTime = 0.0f;
+    float corruptionLevel = 0.0f; 
     std::string deathReason = "";
+    float jumpscareTimer = 0.0f;
 
     struct Player {
         float posX = 1.5f;
@@ -202,8 +228,8 @@ private:
         float moveSpeed = 3.2f;
         float mouseSensitivity = 0.0022f;
 
-        int forward = 0; // W/S (+1 / -1)
-        int strafe = 0;  // A/D (-1 / +1)
+        int forward = 0; 
+        int strafe = 0;  
         float stepAccumulator = 0.0f;
         
         float sanity = 100.0f;
@@ -216,6 +242,84 @@ private:
         float y = 12.5f;
         float speed = 1.8f;
         bool isChasing = false;
+        float animTimer = 0.0f;
+        int currentFrame = 0;
+
+        const std::vector<std::string> frame0 = {
+            "                                                                   ",
+            "                                                         .:-::....         .::.                                          ",
+            "                              ..::----===========+++====+++++++:                                         ",
+            "                            :-==++*##***+====. :=+*##%%%%######*#*+                                      ",
+            "                       .::-==+#@@@@@@@@@#+-     :%@@@@@@@@@@%%#####* .                                   ",
+            "                       -==+*%@@@@@@@@@@@@%-      =@@@@@@@@@@@@@@@%%**=.                                   ",
+            "                       -+*#@@@@@@@@@@@@@@#       -@@@@@@@@@@@@@@%#*++=:.                                  ",
+            "                        :=#@@@@@@@@@@@@#.       :#@@@@@@@@@@@@%*+-:.::-.                                 ",
+            "                           =#@@@@@@@@%+.        .+-:+%@@@@@*-.     ..:-                                  ",
+            "                              :======:           ==.  .              ..:                                 ",
+            "                                                 :+:                 .:-                                 ",
+            "                                                 .:.               ..--* .                               ",
+            "                                        ::.   :=*#+#+              .:-+*                                 ",
+            "                                       :=*#=:--+%@@%+             .:-+**=                                ",
+            "                                             :-#@%%#*=:           .:=+###                                ",
+            "                                                 :+*+:      ......:--+*%%%-                               ",
+            "                                        .-+-.   :**:   .:...::-::::=+#%%%#                               ",
+            "                                      -+%%==*#%%%@@%#*=---::--=----=*#%%%@                               ",
+            "                                   .=+@- :=+ :*:-###@@%***=:=======+*%@@%@                               ",
+            "                                  -*#-          :-=%@@@###*-++++=++*#%@@%*                               ",
+            "                         .       :%%  .:*@%%@%==%-=+ @@@*#%*++++++*#%@@@%                                ",
+            "                        .        #@@@@@@@@@@@@@@@@@@@@@#=%%%+++++*%@@@@%.                                ",
+            "                         ..     :@@@@@@@@@@@@@@@@@@@@@@%-#%%#+**#%@@@@@#                                 ",
+            "                         ..     +@@@@@@@@@@@@@@@@@@@@@@@-#%%%#*#%@@@@@@                                  ",
+            "                   .      .     *@@@@@@@@@@@@@@@@@@@@@@@:%@@%%#%%@@@@@                                   ",
+            "                     -    .     +@@@@@@%@@@@@@@@@@@@@@@@:@%@%%%%@%@%#                                    ",
+            "                          .     .@@@@%#@@@@@@@@@@@@@@@@+-@%%%%%@@%=                                      ",
+            "                                 @@@@@@@@@@@@@@@@@@@@@@ +@%%#=#@@                                        ",
+            "                                  @@@@@+*@@@@@@@@@@@@%: #%%%+=%@                                         ",
+            "                                  . =+*@@@@@@@@@@@% =  .%%#%=+%                                          ",
+            "                                         -*%*+.   +=*  *@%%%--                                           ",
+            "                                      : -+==+++++*%   *@%%@*                                             ",
+            "                                 .=:      .=*+-:    -%@%%                                                ",
+            "                                   :**=:        -+%@@+                                                   ",
+            "                                        .-+**##=                                                         "
+        };
+
+        const std::vector<std::string> frame1 = {
+            "                                                                   ",
+            "                                                         .::-::....         .::.                                          ",
+            "                              ..::----===========+++====+++++++:                                         ",
+            "                            :-==++*##***+====. :=+*##%%%%######*#*+                                      ",
+            "                       .::-==+#@@@@@@@@@#+-     :%@@@@@@@@@@%%#####* .                                   ",
+            "                       -==+*%@@@@@@@@@@@@%-      =@@@@@@@@@@@@@@@%%**=.                                   ",
+            "                       -+*#@@@@@@@@@@@@@@#       -@@@@@@@@@@@@@@%#*++=:.                                  ",
+            "                        :=#@@@@@@@@@@@@#.       :#@@@@@@@@@@@@%*+-:.::-.                                 ",
+            "                           =#@@@@@@@@%+.        .+-:+%@@@@@*-.     ..:-                                  ",
+            "                              :======:           ==.  .              ..:                                 ",
+            "                                                 :+:                 .:-                                 ",
+            "                                                 .:.               ..--* .                               ",
+            "                                        ::.   :=*#+#+              .:-+*                                 ",
+            "                                       :=*#=:--+%@@%+             .:-+**=                                ",
+            "                                             :-#@%%#*=:           .:=+###                                ",
+            "                                                 :+*+:      ......::-+*%%%-                               ",
+            "                                        .-+-.   :**:   .:...::-::::=+#%%%#                               ",
+            "                                      -+%%==*#%%%@@%#*=---::--=----=*#%%%@                               ",
+            "                                   .=+@- :=+ :*:-###@@%***=:=======+*%@@%@                               ",
+            "                                  -*#-          :-=%@@@###*-++++=++*#%@@%*                               ",
+            "                         .       :%%  .:*@%%@%==%-=+ @@@*#%*++++++*#%@@@%                                ",
+            "                        .        #@@@@@@@@@@@@@@@@@@@@@#=%%%+++++*%@@@@%.                                ",
+            "                         ..     :@@@@@@@@@@@@@@@@@@@@@@%-#%%#+**#%@@@@@#                                 ",
+            "                         ..     +@@@@@@@@@@@@@@@@@@@@@@@-#%%%#*#%@@@@@@                                  ",
+            "                   .      .     *@@@@@@@@@@@@@@@@@@@@@@@:%@@%%#%%@@@@@                                   ",
+            "                     -    .     +@@@@@@%@@@@@@@@@@@@@@@@:@%@%%%%@%@%#                                    ",
+            "                          .     .@@@@%#@@@@@@@@@@@@@@@@+-@%%%%%@@%=                                      ",
+            "                                 @@@@@@@@@@@@@@@@@@@@@@ +@%%#=#@@                                        ",
+            "                                  @@@@@+*@@@@@@@@@@@@%: #%%%+=%@                                         ",
+            "                                  . =+*@@@@@@@@@@@% =  .%%#%=+%                                          ",
+            "                                         -*%*+.   +=*  *@%%%--                                           ",
+            "                                      : -+==+++++*%   *@%%@*                                             ",
+            "                                 .=:      .=*+-:    -%@%%                                                ",
+            "                                   :**=:        -+%@@+                                                   ",
+            "                                        .-+**##=                                                         "
+        };
     } stalker;
 
     void updateWindowScale() {
@@ -234,18 +338,28 @@ private:
     uint32_t getElevationColor(float elevation, float dist, int side) {
         uint32_t cBright, cMid, cDark;
 
-        if (elevation >= 0.85f) {
-            cBright = TIER_HIGH_BRIGHT;
-            cMid    = TIER_HIGH_MID;
-            cDark   = TIER_HIGH_DARK;
-        } else if (elevation >= 0.35f) {
-            cBright = TIER_MID_BRIGHT;
-            cMid    = TIER_MID_MID;
-            cDark   = TIER_MID_DARK;
+        if (corruptionLevel >= 0.85f) {
+            cBright = CORRUPT_BRIGHT;
+            cMid    = CORRUPT_MID;
+            cDark   = CORRUPT_DARK;
         } else {
-            cBright = TIER_LOW_BRIGHT;
-            cMid    = TIER_LOW_MID;
-            cDark   = TIER_LOW_DARK;
+            if (elevation >= 0.85f) {
+                cBright = TIER_HIGH_BRIGHT;
+                cMid    = TIER_HIGH_MID;
+                cDark   = TIER_HIGH_DARK;
+            } else if (elevation >= 0.35f) {
+                cBright = TIER_MID_BRIGHT;
+                cMid    = TIER_MID_MID;
+                cDark   = TIER_MID_DARK;
+            } else {
+                cBright = TIER_LOW_BRIGHT;
+                cMid    = TIER_LOW_MID;
+                cDark   = TIER_LOW_DARK;
+            }
+        }
+
+        if (corruptionLevel >= 0.4f && (rand() % 100) < int(corruptionLevel * 5)) {
+            return CORRUPT_BRIGHT;
         }
 
         if (dist < 3.0f)       return (side == 0) ? cBright : cMid;
@@ -253,7 +367,9 @@ private:
         else                   return cDark;
     }
 
-    void generateMazeWithOverpass() {
+    void generateProceduralMultiLevelMaze() {
+        srand(static_cast<unsigned int>(time(nullptr)) + currentLevel * 1337);
+
         for (int r = 0; r < MAP_H; ++r) {
             for (int c = 0; c < MAP_W; ++c) {
                 worldMap[r][c].wallType = 1;
@@ -293,22 +409,39 @@ private:
             }
         }
 
-        int midX = MAP_W / 2;
-        int midY = MAP_H / 2;
+        int highZoneX = (rand() % 2 == 0) ? (MAP_W / 2) : 1;
+        int highZoneY = (rand() % 2 == 0) ? (MAP_H / 2) : 1;
+        int zoneW = MAP_W / 2;
+        int zoneH = MAP_H / 2;
 
-        for (int x = midX - 3; x <= midX + 3; ++x) {
-            worldMap[midY][x].wallType = 0;
-            worldMap[midY][x].floorH = 1.0f;
-            worldMap[midY][x].ceilH = 3.0f;
+        for (int y = highZoneY; y < highZoneY + zoneH; ++y) {
+            for (int x = highZoneX; x < highZoneX + zoneW; ++x) {
+                if (worldMap[y][x].wallType == 0) {
+                    worldMap[y][x].floorH = 1.0f;
+                    worldMap[y][x].ceilH = 3.2f;
+                }
+            }
         }
 
-        worldMap[midY][midX - 4].wallType = 0;
-        worldMap[midY][midX - 4].floorH = 0.5f;
-        worldMap[midY][midX - 4].isStairs = true;
+        for (int y = 1; y < MAP_H - 1; ++y) {
+            for (int x = 1; x < MAP_W - 1; ++x) {
+                if (worldMap[y][x].wallType == 0 && worldMap[y][x].floorH == 1.0f) {
+                    const int nx[4] = { 1, -1, 0, 0 };
+                    const int ny[4] = { 0, 0, 1, -1 };
 
-        worldMap[midY][midX + 4].wallType = 0;
-        worldMap[midY][midX + 4].floorH = 0.5f;
-        worldMap[midY][midX + 4].isStairs = true;
+                    for (int i = 0; i < 4; ++i) {
+                        int adjX = x + nx[i];
+                        int adjY = y + ny[i];
+
+                        if (worldMap[adjY][adjX].wallType == 0 && worldMap[adjY][adjX].floorH == 0.0f) {
+                            worldMap[y][x].floorH = 0.5f;
+                            worldMap[y][x].isStairs = true;
+                            break; 
+                        }
+                    }
+                }
+            }
+        }
 
         endPos = { MAP_W - 2, MAP_H - 2 };
         worldMap[endPos.y][endPos.x].wallType = 2;
@@ -333,16 +466,19 @@ private:
         currentLevel = 1;
         totalSteps = 0;
         levelTime = 0.0f;
+        corruptionLevel = 0.0f; 
         player.sanity = 100.0f;
         player.health = 100.0f;
-        generateMazeWithOverpass();
+        generateProceduralMultiLevelMaze();
         currentState = STATE_PLAYING;
         setCaptureMouse(true);
 
         SDL_LockAudioDevice(audioDevice);
         audioState.inGame = true;
+        audioState.isJumpscare = false;
         audioState.sanity = 100.0f;
         audioState.monsterDist = 20.0f;
+        audioState.corruption = corruptionLevel;
         SDL_UnlockAudioDevice(audioDevice);
     }
 
@@ -350,12 +486,17 @@ private:
         currentLevel++;
         player.sanity = std::min(100.0f, player.sanity + 30.0f);
         player.health = std::min(100.0f, player.health + 30.0f);
-        generateMazeWithOverpass();
+        
+        corruptionLevel = std::min(1.0f, (currentLevel - 1) * 0.11f);
+        
+        generateProceduralMultiLevelMaze();
         currentState = STATE_PLAYING;
         setCaptureMouse(true);
 
         SDL_LockAudioDevice(audioDevice);
         audioState.inGame = true;
+        audioState.isJumpscare = false;
+        audioState.corruption = corruptionLevel;
         SDL_UnlockAudioDevice(audioDevice);
     }
 
@@ -366,9 +507,13 @@ private:
         int startY = row * CHAR_H;
 
         for (int y = 0; y < CHAR_H; ++y) {
+            int drawY = startY + y;
+            if (drawY < 0 || drawY >= NATIVE_HEIGHT) continue; 
             for (int x = 0; x < CHAR_W; ++x) {
+                int drawX = startX + x;
+                if (drawX < 0 || drawX >= NATIVE_WIDTH) continue; 
                 if ((glyph[y] >> (7 - x)) & 1) {
-                    pixelBuffer[(startY + y) * NATIVE_WIDTH + (startX + x)] = fgColor;
+                    pixelBuffer[drawY * NATIVE_WIDTH + drawX] = fgColor;
                 }
             }
         }
@@ -378,6 +523,21 @@ private:
         for (size_t i = 0; i < text.size(); ++i) {
             if (col + i < TOTAL_COLS) {
                 drawGlyph(col + i, row, text[i], color);
+            }
+        }
+    }
+
+    void drawRectFilled(int startCol, int startRow, int numCols, int numRows, uint32_t color) {
+        int x0 = startCol * CHAR_W;
+        int y0 = startRow * CHAR_H;
+        int w = numCols * CHAR_W;
+        int h = numRows * CHAR_H;
+
+        for (int y = y0; y < y0 + h; ++y) {
+            if (y < 0 || y >= NATIVE_HEIGHT) continue;
+            for (int x = x0; x < x0 + w; ++x) {
+                if (x < 0 || x >= NATIVE_WIDTH) continue;
+                pixelBuffer[y * NATIVE_WIDTH + x] = color;
             }
         }
     }
@@ -469,6 +629,36 @@ public:
                         }
                     }
                 }
+                else if (currentState == STATE_PLAYING) {
+                    if (event.key.keysym.sym == SDLK_ESCAPE) {
+                        currentState = STATE_PAUSED;
+                        setCaptureMouse(false);
+                        SDL_LockAudioDevice(audioDevice);
+                        audioState.inGame = false;
+                        SDL_UnlockAudioDevice(audioDevice);
+                    }
+                    else if (event.key.keysym.sym == SDLK_F1) {
+                        nextLevel();
+                    }
+                    else if (event.key.keysym.sym >= SDLK_1 && event.key.keysym.sym <= SDLK_9) {
+                        int num = event.key.keysym.sym - SDLK_1 + 1;
+                        currentLevel = num;
+                        corruptionLevel = std::min(1.0f, (currentLevel - 1) * 0.11f);
+                        generateProceduralMultiLevelMaze();
+                    }
+                }
+                else if (currentState == STATE_PAUSED) {
+                    if (event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_r) {
+                        currentState = STATE_PLAYING;
+                        setCaptureMouse(true);
+                        SDL_LockAudioDevice(audioDevice);
+                        audioState.inGame = true;
+                        SDL_UnlockAudioDevice(audioDevice);
+                    }
+                    else if (event.key.keysym.sym == SDLK_q) {
+                        currentState = STATE_TITLE;
+                    }
+                }
                 else if (currentState == STATE_SUCCESS) {
                     if (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_SPACE) nextLevel();
                     if (event.key.keysym.sym == SDLK_ESCAPE) {
@@ -478,12 +668,6 @@ public:
                 }
                 else if (currentState == STATE_GAMEOVER) {
                     if (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_SPACE) startNewGame();
-                    if (event.key.keysym.sym == SDLK_ESCAPE) {
-                        currentState = STATE_TITLE;
-                        setCaptureMouse(false);
-                    }
-                }
-                else if (currentState == STATE_PLAYING) {
                     if (event.key.keysym.sym == SDLK_ESCAPE) {
                         currentState = STATE_TITLE;
                         setCaptureMouse(false);
@@ -505,13 +689,23 @@ public:
     }
 
     void update(double dt) {
+        if (currentState == STATE_JUMPSCARE) {
+            jumpscareTimer -= static_cast<float>(dt);
+            if (jumpscareTimer <= 0.0f) {
+                currentState = STATE_GAMEOVER;
+                SDL_LockAudioDevice(audioDevice);
+                audioState.isJumpscare = false;
+                SDL_UnlockAudioDevice(audioDevice);
+            }
+            return;
+        }
+
         if (currentState != STATE_PLAYING) return;
 
         float dtSec = static_cast<float>(dt);
         levelTime += dtSec;
         player.takingDamage = false;
 
-        // 1. WASD Vector Movement (Forward + Strafe)
         if (player.forward != 0 || player.strafe != 0) {
             float forwardStep = player.forward * player.moveSpeed * dtSec;
             float strafeStep  = player.strafe  * (player.moveSpeed * 0.85f) * dtSec;
@@ -525,17 +719,21 @@ public:
             float prevX = player.posX;
             float prevY = player.posY;
 
+            int currTileX = int(player.posX);
+            int currTileY = int(player.posY);
+            float currFloor = worldMap[currTileY][currTileX].floorH;
+
             int nextTileX = int(player.posX + moveX + bufX);
             int nextTileY = int(player.posY + moveY + bufY);
 
-            if (worldMap[int(player.posY)][nextTileX].wallType != 1) {
-                float hDiff = std::abs(worldMap[int(player.posY)][nextTileX].floorH - player.posZ);
-                if (hDiff <= 0.65f) player.posX += moveX;
+            if (worldMap[currTileY][nextTileX].wallType != 1) {
+                float hDiff = std::abs(worldMap[currTileY][nextTileX].floorH - currFloor);
+                if (hDiff <= 1.1f) player.posX += moveX;
             }
 
-            if (worldMap[nextTileY][int(player.posX)].wallType != 1) {
-                float hDiff = std::abs(worldMap[nextTileY][int(player.posX)].floorH - player.posZ);
-                if (hDiff <= 0.65f) player.posY += moveY;
+            if (worldMap[nextTileY][currTileX].wallType != 1) {
+                float hDiff = std::abs(worldMap[nextTileY][currTileX].floorH - currFloor);
+                if (hDiff <= 1.1f) player.posY += moveY;
             }
 
             player.stepAccumulator += std::hypot(player.posX - prevX, player.posY - prevY);
@@ -545,40 +743,52 @@ public:
             }
         }
 
-        // 2. Continuous Vertical Height Tracking
-        int currTileX = int(player.posX);
-        int currTileY = int(player.posY);
-        player.targetPosZ = worldMap[currTileY][currTileX].floorH;
+        int standingX = int(player.posX);
+        int standingY = int(player.posY);
+        player.targetPosZ = worldMap[standingY][standingX].floorH;
         player.posZ += (player.targetPosZ - player.posZ) * 0.25f;
 
-        // 3. Stalker AI
         float distToMonster = std::hypot(player.posX - stalker.x, player.posY - stalker.y);
 
-        if (distToMonster < 8.5f) {
-            stalker.isChasing = true;
-            float dx = (player.posX - stalker.x) / distToMonster;
-            float dy = (player.posY - stalker.y) / distToMonster;
+        if (corruptionLevel > 0.5f) {
+            if (distToMonster < 8.5f) {
+                stalker.isChasing = true;
+                
+                stalker.animTimer += dtSec;
+                if (stalker.animTimer > 0.25f) {
+                    stalker.currentFrame = 1 - stalker.currentFrame;
+                    stalker.animTimer = 0.0f;
+                }
 
-            float nx = stalker.x + dx * stalker.speed * dtSec;
-            float ny = stalker.y + dy * stalker.speed * dtSec;
+                float dx = (player.posX - stalker.x) / distToMonster;
+                float dy = (player.posY - stalker.y) / distToMonster;
 
-            if (worldMap[int(ny)][int(nx)].wallType == 0) {
-                stalker.x = nx;
-                stalker.y = ny;
-            }
+                float nx = stalker.x + dx * stalker.speed * dtSec;
+                float ny = stalker.y + dy * stalker.speed * dtSec;
 
-            player.sanity -= (6.0f / std::max(1.0f, distToMonster)) * dtSec;
-            if (distToMonster < 1.1f) {
-                player.health -= 28.0f * dtSec;
-                player.takingDamage = true;
+                if (worldMap[int(ny)][int(nx)].wallType == 0) {
+                    stalker.x = nx;
+                    stalker.y = ny;
+                }
+
+                player.sanity -= (6.0f / std::max(1.0f, distToMonster)) * dtSec;
+                if (distToMonster < 0.75f) {
+                    deathReason = "CAUGHT IN THE DARK BY THE ENTITY";
+                    currentState = STATE_JUMPSCARE;
+                    jumpscareTimer = 2.5f; // Jumpscare lasts 2.5 seconds
+                    setCaptureMouse(false);
+                    
+                    SDL_LockAudioDevice(audioDevice);
+                    audioState.inGame = false;
+                    audioState.isJumpscare = true;
+                    SDL_UnlockAudioDevice(audioDevice);
+                    return;
+                }
+            } else {
+                stalker.isChasing = false;
             }
         } else {
-            stalker.isChasing = false;
-            player.sanity -= 0.08f * dtSec;
-            if (distToMonster > 12.0f) {
-                player.sanity = std::min(100.0f, player.sanity + 1.0f * dtSec);
-                player.health = std::min(100.0f, player.health + 0.8f * dtSec);
-            }
+            player.sanity = 100.0f;
         }
 
         player.sanity = std::max(0.0f, player.sanity);
@@ -604,7 +814,7 @@ public:
             return;
         }
 
-        if (currTileX == endPos.x && currTileY == endPos.y) {
+        if (standingX == endPos.x && standingY == endPos.y) {
             currentState = STATE_SUCCESS;
             setCaptureMouse(false);
             SDL_LockAudioDevice(audioDevice);
@@ -618,6 +828,86 @@ public:
         audioState.monsterDist = distToMonster;
         audioState.isChasing = stalker.isChasing;
         SDL_UnlockAudioDevice(audioDevice);
+    }
+
+    void renderStalkerSprite() {
+        float spriteX = stalker.x - player.posX;
+        float spriteY = stalker.y - player.posY;
+
+        float invDet = 1.0f / (player.planeX * player.dirY - player.dirX * player.planeY);
+        float transformX = invDet * (player.dirY * spriteX - player.dirX * spriteY);
+        float transformY = invDet * (-player.planeY * spriteX + player.planeX * spriteY);
+
+        if (transformY <= 0.2f) return;
+
+        int viewWidth = (currentDifficulty == DIFF_EASY) ? 68 : TOTAL_COLS;
+        int screenX = int((viewWidth / 2) * (1.0f + transformX / transformY));
+
+        int spriteHeight = std::abs(int(ROWS / transformY));
+        int drawStartY = -spriteHeight / 2 + ROWS / 2 + int(player.pitch);
+        int drawEndY = spriteHeight / 2 + ROWS / 2 + int(player.pitch);
+
+        int spriteWidth = std::abs(int(ROWS / transformY * 1.5f));
+        int drawStartX = -spriteWidth / 2 + screenX;
+        int drawEndX = spriteWidth / 2 + screenX;
+
+        const auto& currentSprite = (stalker.currentFrame == 0) ? stalker.frame0 : stalker.frame1;
+        int rowCount = currentSprite.size();
+        int colCount = currentSprite[0].size();
+
+        for (int stripe = drawStartX; stripe < drawEndX; ++stripe) {
+            if (stripe < 0 || stripe >= viewWidth) continue;
+
+            int texX = int((stripe - drawStartX) * colCount / spriteWidth);
+            if (texX < 0 || texX >= colCount) continue;
+
+            for (int y = drawStartY; y < drawEndY; ++y) {
+                if (y < 0 || y >= ROWS) continue;
+
+                int texY = int((y - drawStartY) * rowCount / (drawEndY - drawStartY));
+                if (texY < 0 || texY >= rowCount) continue;
+
+                char glyph = currentSprite[texY][texX];
+                if (glyph != ' ' && glyph != '.') {
+                    uint32_t color = (transformY < 3.0f) ? CORRUPT_BRIGHT : TIER_HIGH_BRIGHT;
+                    drawGlyph(stripe, y, glyph, color);
+                }
+            }
+        }
+    }
+
+    void renderJumpscareScreen() {
+        // Flash full screen monster art and creepy text
+        const auto& currentSprite = stalker.frame0;
+        int rowCount = currentSprite.size();
+        int colCount = currentSprite[0].size();
+
+        // Render monster scaled to fill screen center
+        for (int y = 0; y < ROWS; ++y) {
+            for (int x = 10; x < TOTAL_COLS - 10; ++x) {
+                int texX = (x - 10) * colCount / (TOTAL_COLS - 20);
+                int texY = y * rowCount / ROWS;
+                if (texX >= 0 && texX < colCount && texY >= 0 && texY < rowCount) {
+                    char glyph = currentSprite[texY][texX];
+                    if (glyph != ' ' && glyph != '.') {
+                        uint32_t flashCol = ((rand() % 2) == 0) ? RED_GOAL_BRIGHT : 0xFFFFFFFF;
+                        drawGlyph(x, y, glyph, flashCol);
+                    }
+                }
+            }
+        }
+
+        // Random flashing creepy corrupted text around the screen
+        std::vector<std::string> creepyPhrases = {
+            "I SAW YOU", "YOU CANT HIDE", "HE IS HERE", "NO ESCAPE", "LOOK AT ME", "DEATH AWAITS"
+        };
+        
+        for (int i = 0; i < 4; ++i) {
+            int rx = rand() % 60 + 5;
+            int ry = rand() % 50 + 5;
+            std::string phrase = creepyPhrases[rand() % creepyPhrases.size()];
+            drawText(rx, ry, phrase, RED_GOAL_BRIGHT);
+        }
     }
 
     void render3DView() {
@@ -673,7 +963,11 @@ public:
             else           perpWallDist = (sideDistY - deltaDistY);
             if (perpWallDist < 0.05f) perpWallDist = 0.05f;
 
-            // 1. Raycasted Textured Floor 
+            int vOffset = 0;
+            if (corruptionLevel > 0.5f && (rand() % 100) < int(corruptionLevel * 20)) {
+                vOffset = (rand() % 5) - 2; 
+            }
+
             for (int r = horizon + 1; r < ROWS; ++r) {
                 float p = r - horizon;
                 float straightDist = (ROWS * totalPlayerZ) / p;
@@ -690,19 +984,40 @@ public:
                     uint32_t floorColor = getElevationColor(sampledFloorH, straightDist, 0);
 
                     char floorGlyph = ' ';
+                    
                     if (worldMap[fTileY][fTileX].isStairs) {
                         floorGlyph = (int(straightDist * 3.0f) % 2 == 0) ? '=' : '_';
-                    } else if (straightDist < 8.0f && ((fTileX + fTileY) % 2 == 0) && (col % 2 == 0)) {
-                        floorGlyph = (sampledFloorH > 0.8f) ? '^' : '.';
+                    } 
+                    else if (sampledFloorH > 0.8f) {
+                        bool isCheck = ((fTileX + fTileY) % 2 == 0);
+                        floorGlyph = isCheck ? '#' : '-';
+                        
+                        if (corruptionLevel < 0.85f) {
+                            floorColor = isCheck ? TIER_HIGH_BRIGHT : TIER_HIGH_DARK;
+                        } else {
+                            floorColor = isCheck ? CORRUPT_BRIGHT : CORRUPT_DARK;
+                        }
+
+                        if (straightDist > 6.0f && (col % 2 != 0)) {
+                            floorGlyph = ' ';
+                        }
+                    } 
+                    else {
+                        if (straightDist < 8.0f && ((fTileX + fTileY) % 2 == 0) && (col % 2 == 0)) {
+                            floorGlyph = '.';
+                        }
+                    }
+
+                    if (corruptionLevel > 0.3f && floorGlyph != ' ' && (rand() % 100) < int(corruptionLevel * 10)) {
+                        floorGlyph = "?!@#$%^&*"[rand() % 9];
                     }
 
                     if (floorGlyph != ' ') {
-                        drawGlyph(col, r, floorGlyph, floorColor);
+                        drawGlyph(col, r + vOffset, floorGlyph, floorColor);
                     }
                 }
             }
 
-            // 2. Solid Walls
             float wallFloorH = (mapY >= 0 && mapY < MAP_H && mapX >= 0 && mapX < MAP_W) ? worldMap[mapY][mapX].floorH : 0.0f;
             float wallCeilH  = (mapY >= 0 && mapY < MAP_H && mapX >= 0 && mapX < MAP_W) ? worldMap[mapY][mapX].ceilH : 2.0f;
 
@@ -718,20 +1033,20 @@ public:
             else if (perpWallDist <= 9.00f) wallGlyph = '-';
             else if (perpWallDist <= 11.0f) wallGlyph = '.';
 
-            uint32_t wallColor;
-            if (hit == 2) {
-                wallColor = (side == 0) ? RED_GOAL_BRIGHT : RED_GOAL_DARK;
-            } else {
-                wallColor = getElevationColor(wallFloorH, perpWallDist, side);
+            if (corruptionLevel > 0.3f && wallGlyph != ' ' && (rand() % 100) < int(corruptionLevel * 10)) {
+                wallGlyph = "?!@#$%^&*"[rand() % 9];
             }
+
+            uint32_t wallColor;
+            if (hit == 2) wallColor = (side == 0) ? RED_GOAL_BRIGHT : RED_GOAL_DARK;
+            else          wallColor = getElevationColor(wallFloorH, perpWallDist, side);
 
             for (int r = 0; r < ROWS; ++r) {
                 if (r >= drawStart && r <= drawEnd && wallGlyph != ' ') {
-                    drawGlyph(col, r, wallGlyph, wallColor);
+                    drawGlyph(col, r + vOffset, wallGlyph, wallColor);
                 }
             }
 
-            // 3. Elevation Step-Risers
             if (hitStepRiser && stepRiserDist > 0.1f && stepRiserDist < perpWallDist) {
                 float lowH = std::min(prevFloorH, prevFloorH + stepFloorDiff);
                 float highH = std::max(prevFloorH, prevFloorH + stepFloorDiff);
@@ -744,10 +1059,14 @@ public:
 
                 for (int r = stepTop; r <= stepBottom; ++r) {
                     if (r >= 0 && r < ROWS) {
-                        drawGlyph(col, r, stepGlyph, stepColor);
+                        drawGlyph(col, r + vOffset, stepGlyph, stepColor);
                     }
                 }
             }
+        }
+
+        if (corruptionLevel > 0.5f) {
+            renderStalkerSprite();
         }
 
         int cx = viewWidth / 2;
@@ -755,8 +1074,11 @@ public:
         drawGlyph(cx, cy, '+', 0xFF94A3B8);
 
         if (player.takingDamage) {
+            drawRectFilled(34, 27, 16, 3, 0xFF050505);
             drawText(36, 28, "! ATTACKED !", RED_GOAL_BRIGHT);
         }
+
+        drawRectFilled(1, 1, 52, 7, 0xFF050505);
 
         std::string elevStr;
         uint32_t elevColor;
@@ -773,11 +1095,16 @@ public:
 
         drawText(2, 2, "ELEVATION: " + elevStr + " | STEPS: " + std::to_string(totalSteps), elevColor);
         
-        uint32_t hpCol = (player.health < 30.0f) ? RED_GOAL_BRIGHT : ((player.health < 60.0f) ? 0xFFF59E0B : TIER_HIGH_BRIGHT);
-        drawText(2, 4, "HEALTH: " + std::to_string(int(player.health)) + "%", hpCol);
+        if (corruptionLevel < 0.5f) {
+            drawText(2, 4, "TEST MAZE UTILITY v1.0", TIER_LOW_BRIGHT);
+            drawText(2, 6, "SYS: CLEAN", TIER_LOW_BRIGHT);
+        } else {
+            uint32_t hpCol = (player.health < 30.0f) ? RED_GOAL_BRIGHT : ((player.health < 60.0f) ? 0xFFF59E0B : TIER_HIGH_BRIGHT);
+            drawText(2, 4, "SYS ERR: HEALTH: " + std::to_string(int(player.health)) + "%", hpCol);
 
-        uint32_t sanCol = (player.sanity < 30.0f) ? RED_GOAL_BRIGHT : ((player.sanity < 60.0f) ? 0xFFF59E0B : TIER_HIGH_BRIGHT);
-        drawText(2, 6, "SANITY: " + std::to_string(int(player.sanity)) + "%", sanCol);
+            uint32_t sanCol = (player.sanity < 30.0f) ? RED_GOAL_BRIGHT : ((player.sanity < 60.0f) ? 0xFFF59E0B : TIER_HIGH_BRIGHT);
+            drawText(2, 6, "SYS ERR: SANITY: " + std::to_string(int(player.sanity)) + "%", sanCol);
+        }
 
         if (currentDifficulty == DIFF_EASY) {
             renderSidebarMinimap();
@@ -785,9 +1112,7 @@ public:
     }
 
     void renderSidebarMinimap() {
-        for (int r = 0; r < ROWS; ++r) {
-            drawGlyph(68, r, '|', 0xFF334155);
-        }
+        for (int r = 0; r < ROWS; ++r) drawGlyph(68, r, '|', 0xFF334155);
 
         int miniStartX = 72;
         int miniStartY = 3;
@@ -797,7 +1122,13 @@ public:
                 char mapCh = ' ';
                 uint32_t mapCol = 0xFF1E293B;
 
-                if (worldMap[r][c].wallType == 1) {
+                if (r == startPos.y && c == startPos.x) {
+                    mapCh = 'S';
+                    mapCol = TIER_HIGH_BRIGHT;
+                } else if (r == endPos.y && c == endPos.x) {
+                    mapCh = 'E';
+                    mapCol = RED_GOAL_BRIGHT;
+                } else if (worldMap[r][c].wallType == 1) {
                     mapCh = '#';
                     mapCol = 0xFF475569;
                 } else if (worldMap[r][c].isStairs) {
@@ -806,13 +1137,7 @@ public:
                 } else if (worldMap[r][c].floorH > 0.7f) {
                     mapCh = '^';
                     mapCol = TIER_HIGH_BRIGHT;
-                } else if (r == startPos.y && c == startPos.x) {
-                    mapCh = 'S';
-                    mapCol = TIER_HIGH_BRIGHT;
-                } else if (r == endPos.y && c == endPos.x) {
-                    mapCh = 'E';
-                    mapCol = RED_GOAL_BRIGHT;
-                }
+                } 
 
                 drawGlyph(miniStartX + c, miniStartY + r, mapCh, mapCol);
             }
@@ -849,6 +1174,17 @@ public:
         drawText(26, 44, "UP/DOWN: SELECT | LEFT/RIGHT: CHANGE | ENTER: START", 0xFF334155);
     }
 
+    void renderPauseScreen() {
+        drawRectFilled(30, 18, 40, 24, 0xEE050505);
+        drawText(38, 22, "========================", TIER_MID_BRIGHT);
+        drawText(38, 24, "      GAME PAUSED       ", TIER_MID_BRIGHT);
+        drawText(38, 26, "========================", TIER_MID_BRIGHT);
+
+        drawText(35, 32, "[R / ESC] RESUME GAME", TIER_HIGH_BRIGHT);
+        drawText(35, 36, "[Q] QUIT TO TITLE", RED_GOAL_BRIGHT);
+        drawText(34, 40, "DEV: [F1] SKIP LVL | [1-9] SET LVL", 0xFF64748B);
+    }
+
     void renderSuccessScreen() {
         drawText(36, 12, "****************************", TIER_HIGH_BRIGHT);
         drawText(36, 14, "      MAZE COMPLETED!       ", TIER_HIGH_BRIGHT);
@@ -857,8 +1193,11 @@ public:
         drawText(34, 22, "COMPLETED LEVEL:  " + std::to_string(currentLevel), 0xFFFFFFFF);
         drawText(34, 25, "TOTAL STEPS:      " + std::to_string(totalSteps), 0xFFFFFFFF);
         drawText(34, 28, "TIME TAKEN:       " + std::to_string(int(levelTime)) + " SECONDS", 0xFFFFFFFF);
-        drawText(34, 31, "REMAINING HEALTH: " + std::to_string(int(player.health)) + "%", TIER_HIGH_BRIGHT);
-        drawText(34, 34, "REMAINING SANITY: " + std::to_string(int(player.sanity)) + "%", TIER_HIGH_BRIGHT);
+        
+        if (corruptionLevel >= 0.5f) {
+            drawText(34, 31, "REMAINING HEALTH: " + std::to_string(int(player.health)) + "%", TIER_HIGH_BRIGHT);
+            drawText(34, 34, "REMAINING SANITY: " + std::to_string(int(player.sanity)) + "%", TIER_HIGH_BRIGHT);
+        }
 
         drawText(28, 44, "PRESS [ENTER / SPACE] TO ADVANCE TO NEXT LEVEL", TIER_LOW_BRIGHT);
         drawText(38, 47, "PRESS [ESC] FOR MAIN MENU", 0xFF64748B);
@@ -884,6 +1223,13 @@ public:
 
         if (currentState == STATE_TITLE) renderTitleScreen();
         else if (currentState == STATE_PLAYING) render3DView();
+        else if (currentState == STATE_PAUSED) {
+            render3DView();
+            renderPauseScreen();
+        }
+        else if (currentState == STATE_JUMPSCARE) {
+            renderJumpscareScreen();
+        }
         else if (currentState == STATE_SUCCESS) renderSuccessScreen();
         else if (currentState == STATE_GAMEOVER) renderGameOverScreen();
 
